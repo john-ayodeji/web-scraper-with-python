@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from crawl import crawl_site_async
+from graph_report import write_graph_report
 from json_report import write_json_report
 
 async def main_async():
@@ -34,9 +35,15 @@ async def main_async():
             max_concurrency=max_concurrency,
             max_pages=max_pages,
         )
+        total_internal = sum(page.get("internal_link_count", 0) for page in page_data.values())
+        total_external = sum(page.get("external_link_count", 0) for page in page_data.values())
         print(f"\npages found: {len(page_data)}")
+        print(f"internal links found: {total_internal}")
+        print(f"external links found: {total_external}")
         write_json_report(page_data)
         print("wrote JSON report to report.json")
+        write_graph_report(page_data)
+        print("wrote graph image to report_graph.png")
 
 
 if __name__ == "__main__":

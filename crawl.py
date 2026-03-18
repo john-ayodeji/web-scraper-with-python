@@ -1,5 +1,6 @@
-from urllib import parse
 import asyncio
+from urllib import parse
+
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -31,7 +32,9 @@ def get_urls_from_html(html, base_url):
         href = link.get("href")
         if href:
             absolute_url = parse.urljoin(base_url, href)
-            urls.append(absolute_url)
+            parsed = parse.urlparse(absolute_url)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                urls.append(absolute_url)
     return urls
 
 def get_images_from_html(html, base_url):
@@ -44,34 +47,67 @@ def get_images_from_html(html, base_url):
             images.append(absolute_url)
     return images
 
+
+def split_links_by_domain(urls, base_domain):
+    internal_links = set()
+    external_links = set()
+
+    for url in urls:
+        parsed = parse.urlparse(url)
+        if parsed.netloc == base_domain:
+            internal_links.add(normalize_url(url))
+        else:
+            external_links.add(url)
+
+    return sorted(internal_links), sorted(external_links)
+
 def extract_page_data(html, page_url):
+    base_domain = parse.urlparse(page_url).netloc
     heading = get_heading_from_html(html)
     first_paragraph = get_first_paragraph_from_html(html)
     outgoing_links = get_urls_from_html(html, page_url)
+    internal_links, external_links = split_links_by_domain(outgoing_links, base_domain)
     image_urls = get_images_from_html(html, page_url)
     return {
         "url": normalize_url(page_url),
         "heading": heading,
         "first_paragraph": first_paragraph,
         "outgoing_links": outgoing_links,
-        "image_urls": image_urls
+        "internal_links": internal_links,
+        "external_links": external_links,
+        "internal_link_count": len(internal_links),
+        "external_link_count": len(external_links),
+        "image_urls": image_urls,
     }
 
+
 class AsyncCrawler:
-    def __init__(self, base_url, max_concurrency=3, max_pages=50):
+    def __init__(
+        self,
+        base_url,
+        max_concurrency=3,
+        max_pages=50,
+        request_timeout=20,
+        max_retries=2,
+        retry_backoff_seconds=0.5,
+    ):
         self.base_url = base_url
         self.base_domain = parse.urlparse(base_url).netloc
         self.page_data = {}
         self.lock = asyncio.Lock()
         self.max_concurrency = max_concurrency
         self.max_pages = max_pages
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
         self.should_stop = False
         self.all_tasks = set()
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.session = None
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -99,6 +135,10 @@ class AsyncCrawler:
                 "heading": None,
                 "first_paragraph": None,
                 "outgoing_links": [],
+                "internal_links": [],
+                "external_links": [],
+                "internal_link_count": 0,
+                "external_link_count": 0,
                 "image_urls": [],
             }
             return True
@@ -107,14 +147,27 @@ class AsyncCrawler:
         if self.session is None:
             raise RuntimeError("Crawler session is not initialized")
 
-        async with self.session.get(url, headers={"User-Agent": "BootCrawler/1.0"}) as response:
-            response.raise_for_status()
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with self.session.get(url, headers={"User-Agent": "BootCrawler/1.0"}) as response:
+                    response.raise_for_status()
 
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/html" not in content_type:
-                raise ValueError(f"Expected text/html, got {content_type}")
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/html" not in content_type:
+                        raise ValueError(f"Expected text/html, got {content_type}")
 
-            return await response.text()
+                    return await response.text()
+            except asyncio.CancelledError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+                last_error = error
+                if attempt == self.max_retries:
+                    break
+                backoff = self.retry_backoff_seconds * (2 ** attempt)
+                await asyncio.sleep(backoff)
+
+        raise RuntimeError(f"Failed to fetch {url}: {last_error}")
 
     async def crawl_page(self, current_url=None):
         if self.should_stop:
@@ -142,7 +195,13 @@ class AsyncCrawler:
                 async with self.lock:
                     self.page_data[normalized_current_url] = extracted_data
 
-                discovered_urls = get_urls_from_html(html, current_url)
+                discovered_urls = [
+                    url
+                    for url in extracted_data["outgoing_links"]
+                    if parse.urlparse(url).netloc == self.base_domain
+                ]
+        except asyncio.CancelledError:
+            return
         except Exception as e:
             print(f"error crawling {current_url}: {e}")
             return
@@ -167,10 +226,18 @@ class AsyncCrawler:
         return self.page_data
 
 
-async def crawl_site_async(base_url, max_concurrency=3, max_pages=50):
+async def crawl_site_async(
+    base_url,
+    max_concurrency=3,
+    max_pages=50,
+    request_timeout=20,
+    max_retries=2,
+):
     async with AsyncCrawler(
         base_url,
         max_concurrency=max_concurrency,
         max_pages=max_pages,
+        request_timeout=request_timeout,
+        max_retries=max_retries,
     ) as crawler:
         return await crawler.crawl()
